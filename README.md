@@ -106,10 +106,36 @@ VECTOR_DIMENSION=384  # Depends on the embedding model used
 
 The project uses Docker containers for Lambda deployment. Each function has its own Dockerfile and requirements.txt.
 
-To deploy:
-1. Build Docker images
+### Environment-Based Deployment
+
+The deployment script supports separate development and production environments. Functions are automatically prefixed with the environment name (e.g., `dev-file_processor` or `prod-file_processor`).
+
+To deploy to different environments:
+
+```bash
+# Deploy to development environment (default)
+./deploy.sh
+
+# Deploy to development environment explicitly
+./deploy.sh --env dev
+
+# Deploy to production environment
+./deploy.sh --env prod
+```
+
+Key features of environment-based deployment:
+- Separate Lambda functions for each environment
+- Environment-specific Docker image tags
+- Shared ECR repositories with environment-specific tags
+- Isolated environment variables per environment
+- Clear separation between development and production resources
+
+### Deployment Process
+
+The deployment process includes:
+1. Build Docker images with environment-specific tags
 2. Push to ECR
-3. Update Lambda functions
+3. Update Lambda functions with environment prefixes
 
 The `deploy.sh` script handles all these steps automatically.
 

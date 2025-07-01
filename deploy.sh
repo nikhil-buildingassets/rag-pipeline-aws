@@ -3,6 +3,32 @@
 # Exit on error
 set -e
 
+# Default environment
+ENVIRONMENT="dev"
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --env)
+            ENVIRONMENT="$2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: $0 [--env dev|prod]"
+            exit 1
+            ;;
+    esac
+done
+
+# Validate environment
+if [[ "${ENVIRONMENT}" != "dev" && "${ENVIRONMENT}" != "prod" ]]; then
+    echo "Invalid environment. Must be either 'dev' or 'prod'"
+    exit 1
+fi
+
+echo "Deploying to ${ENVIRONMENT} environment"
+
 # AWS account and region configuration
 AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 AWS_REGION=$(aws configure get region)
@@ -36,8 +62,9 @@ load_env_vars() {
 deploy_function() {
     local function_name=$1
     local function_dir="functions/${function_name}"
+    local prefixed_function_name="${ENVIRONMENT}-${function_name}"
     local image_name="${function_name}"
-    local image_tag="latest"
+    local image_tag="${ENVIRONMENT}"
     
     # Check if function directory contains required files
     if [[ ! -f "${function_dir}/Dockerfile" ]] || [[ ! -f "${function_dir}/main.py" ]]; then
@@ -45,7 +72,7 @@ deploy_function() {
         return
     fi
     
-    echo "Deploying ${function_name}..."
+    echo "Deploying ${prefixed_function_name}..."
     echo "----------------------------------------"
     
     # Load environment variables
@@ -62,7 +89,7 @@ deploy_function() {
         docker login --username AWS --password-stdin "${ECR_REGISTRY}"
     
     # Build Docker image
-    echo "Building Docker image for ${function_name}..."
+    echo "Building Docker image for ${prefixed_function_name}..."
     docker build -t "${image_name}:${image_tag}" \
         --build-arg FUNCTION_DIR="${function_name}" \
         -f "${function_dir}/Dockerfile" .
@@ -86,21 +113,21 @@ deploy_function() {
         env_json+="}"
         
         aws lambda update-function-configuration \
-            --function-name "${function_name}" \
+            --function-name "${prefixed_function_name}" \
             --environment "Variables=${env_json}"
     fi
     
     # Update Lambda function code
     echo "Updating Lambda function code..."
     aws lambda update-function-code \
-        --function-name "${function_name}" \
+        --function-name "${prefixed_function_name}" \
         --image-uri "${ECR_REGISTRY}/${image_name}:${image_tag}"
     
     # Clean up local Docker images
     echo "Cleaning up local images..."
     docker rmi "${image_name}:${image_tag}" "${ECR_REGISTRY}/${image_name}:${image_tag}"
     
-    echo "${function_name} deployed successfully"
+    echo "${prefixed_function_name} deployed successfully"
     echo "----------------------------------------"
 }
 
