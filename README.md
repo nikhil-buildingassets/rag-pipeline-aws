@@ -43,7 +43,7 @@ graph LR
 - AWS Account with appropriate permissions
 - AWS CLI configured locally
 - Docker installed locally
-- Python 3.9+
+- Python 3.12
 
 ## Setup Instructions
 
@@ -104,40 +104,128 @@ VECTOR_DIMENSION=384  # Depends on the embedding model used
 
 ## Deployment
 
-The project uses Docker containers for Lambda deployment. Each function has its own Dockerfile and requirements.txt.
+The deployment script supports both Docker-based and traditional ZIP-based Lambda deployments with automatic API Gateway integration.
 
-### Environment-Based Deployment
+### Deployment Methods
 
-The deployment script supports separate development and production environments. Functions are automatically prefixed with the environment name (e.g., `dev-file_processor` or `prod-file_processor`).
+The script automatically chooses the deployment method based on the function structure:
 
-To deploy to different environments:
+#### Docker Deployment
+- **When**: If `Dockerfile` exists in the function directory
+- **Process**: Builds Docker image → Pushes to ECR → Deploys Lambda from container image
+- **Benefits**: Better for functions with complex dependencies or large packages
+
+#### ZIP Deployment
+- **When**: If no `Dockerfile` found in the function directory
+- **Process**: Packages function code → Installs dependencies → Creates ZIP → Deploys Lambda from ZIP
+- **Benefits**: Faster deployment for simple functions
+
+### Command Line Options
 
 ```bash
-# Deploy to development environment (default)
+Usage: ./deploy.sh [--env dev|prod] [--function function_name]
+  --env: Environment to deploy to (dev or prod)
+  --function: Deploy specific function only (optional)
+```
+
+### Deployment Examples
+
+#### Deploy All Functions
+```bash
+# Deploy all functions to development environment (default)
 ./deploy.sh
 
-# Deploy to development environment explicitly
+# Deploy all functions to development environment explicitly
 ./deploy.sh --env dev
 
-# Deploy to production environment
+# Deploy all functions to production environment
 ./deploy.sh --env prod
 ```
 
-Key features of environment-based deployment:
-- Separate Lambda functions for each environment
-- Environment-specific Docker image tags
-- Shared ECR repositories with environment-specific tags
-- Isolated environment variables per environment
-- Clear separation between development and production resources
+#### Deploy Specific Function
+```bash
+# Deploy specific function to development
+./deploy.sh --env dev --function file_processor
+
+# Deploy specific function to production
+./deploy.sh --env prod --function rag_pipeline
+
+# Deploy function with Docker (if Dockerfile exists)
+./deploy.sh --env dev --function process_and_embeds
+
+# Deploy function with ZIP (if no Dockerfile)
+./deploy.sh --env dev --function pre_upload_check
+```
+
+### Environment-Based Deployment
+
+The deployment script supports separate development and production environments:
+
+- **Function Naming**: Functions are prefixed with environment name (e.g., `dev-file_processor`, `prod-file_processor`)
+- **API Gateway**: Each function gets its own API Gateway endpoint with environment-specific naming
+- **ECR Tags**: Docker images are tagged with environment names
+- **Environment Variables**: Loaded from `.env` files in each function directory
+
+### API Gateway Integration
+
+The deployment script automatically manages API Gateway for each Lambda function:
+
+#### Features
+- **Automatic Creation**: Creates API Gateway if it doesn't exist
+- **Smart Naming**: Converts function names (replaces `_` with `-` for API Gateway compatibility)
+- **Skip Logic**: Skips API Gateway creation on redeployment if already exists
+- **Proxy Integration**: Sets up `{proxy+}` resources for flexible routing
+- **Permissions**: Automatically grants API Gateway permission to invoke Lambda
+
+#### API Gateway URLs
+After deployment, each function gets an API Gateway endpoint:
+```
+https://{api-id}.execute-api.{region}.amazonaws.com/{environment}
+```
+
+Example:
+```
+https://abc123def456.execute-api.us-east-1.amazonaws.com/dev
+```
 
 ### Deployment Process
 
-The deployment process includes:
-1. Build Docker images with environment-specific tags
-2. Push to ECR
-3. Update Lambda functions with environment prefixes
+The complete deployment process includes:
 
-The `deploy.sh` script handles all these steps automatically.
+1. **Function Discovery**: Scans `functions/` directory for deployable functions
+2. **Environment Variables**: Loads variables from `.env` files
+3. **Deployment Method Selection**: Chooses Docker or ZIP based on Dockerfile presence
+4. **Code Deployment**: Updates Lambda function code using selected method
+5. **API Gateway Management**: Creates or validates API Gateway endpoints
+6. **Cleanup**: Removes temporary files and local Docker images
+
+### Prerequisites for Deployment
+
+- AWS CLI configured with appropriate permissions
+- Docker installed (for Docker-based deployments)
+- Python 3.12 and pip (for ZIP-based deployments)
+- Required IAM permissions for:
+  - Lambda function management
+  - ECR repository access
+  - API Gateway management
+  - S3 bucket access
+
+### Function Structure Requirements
+
+Each function directory must contain:
+- `main.py` - Main Lambda function handler
+- `requirements.txt` - Python dependencies (optional)
+- `Dockerfile` - For Docker deployment (optional)
+- `.env` - Environment variables (optional)
+
+### Deployment Validation
+
+The script validates:
+- Function directory existence
+- Required files presence
+- Environment parameter validity
+- AWS credentials and permissions
+- Docker availability (for Docker deployments)
 
 ## Development
 
