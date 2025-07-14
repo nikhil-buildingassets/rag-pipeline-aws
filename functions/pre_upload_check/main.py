@@ -3,6 +3,7 @@ import os
 import base64
 import boto3
 import numpy as np
+import logging
 
 # Initialize AWS clients
 s3 = boto3.client('s3')
@@ -23,7 +24,7 @@ def ensure_folder_structure(bucket, file_key):
     
     Args:
         bucket (str): S3 bucket name
-        file_key (str): Full path of the file in S3 (e.g., 'Demo_org/BuildingA/measures/report.pdf')
+        file_key (str): Full path of the file in S3 (e.g., 'org_folder/BuildingA/measures/report.pdf')
     """
     # Split the path into components
     path_parts = file_key.split('/')
@@ -42,7 +43,7 @@ def ensure_folder_structure(bucket, file_key):
             # Create folder if it doesn't exist
             try:
                 s3.put_object(Bucket=bucket, Key=current_path, Body="")
-                print(f"Created folder: {current_path}")
+                logging.info(f"Created folder: {current_path}")
             except Exception as e:
                 raise Exception(f"Failed to create folder {current_path}: {str(e)}")
 
@@ -106,7 +107,7 @@ def get_existing_file_embeddings(bucket, existing_files):
                 'embedding': embedding
             }
         except Exception as e:
-            print(f"Error processing {file_meta['key']}: {str(e)}")
+            logging.error(f"Error processing {file_meta['key']}: {str(e)}")
             continue
     
     return embeddings
@@ -136,7 +137,7 @@ def find_similar_files(file_content, existing_files_data, similarity_threshold=0
                     'similarity': float(similarity)
                 })
         except Exception as e:
-            print(f"Error calculating similarity for {file_key}: {str(e)}")
+            logging.error(f"Error calculating similarity for {file_key}: {str(e)}")
             continue
     
     return similar_files
@@ -150,7 +151,8 @@ def lambda_handler(event, context):
         "bucket": "your-bucket-name",
         "file_key": "path/to/file",
         "file_content": "base64_encoded_content",
-        "replace_if_exists": false
+        "replace_if_exists": false,
+        "org_folder": "organization_folder_name"  # Added this field
     }
     """
     try:
@@ -159,6 +161,11 @@ def lambda_handler(event, context):
         file_key = event['file_key']
         file_content_base64 = event['file_content']
         replace_if_exists = event.get('replace_if_exists', False)
+        org_folder = event.get('org_folder')
+        
+        # If org_folder is provided, prepend it to the file_key
+        if org_folder:
+            file_key = f"{org_folder}/{file_key}"
         
         # Decode base64 file content
         try:
@@ -231,8 +238,7 @@ def lambda_handler(event, context):
                     })
                 )
             except Exception as e:
-                print(f"Warning: Failed to trigger file processor: {str(e)}")
-                # Continue execution as file upload was successful
+                logging.warning(f"Failed to trigger file processor: {str(e)}")
             
             return {
                 'statusCode': 200,
