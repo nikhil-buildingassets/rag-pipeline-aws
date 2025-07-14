@@ -48,24 +48,33 @@ ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 load_env_vars() {
     local function_name=$1
     local env_file="functions/${function_name}/.env"
-    local env_vars=()
-    
+    local vars=""
+    local first=true
+
     if [[ -f "${env_file}" ]]; then
-        echo "Loading environment variables from ${env_file}"
         while IFS='=' read -r key value || [[ -n "$key" ]]; do
             # Skip comments and empty lines
-            [[ $key =~ ^#.*$ ]] && continue
+            [[ $key =~ ^[[:space:]]*# ]] && continue
             [[ -z "$key" ]] && continue
-            
-            # Remove any quotes from the value
-            value=$(echo "$value" | tr -d '"'"'")
-            env_vars+=("${key}=${value}")
+
+            # Trim whitespace
+            key=$(echo "$key" | xargs)
+            value=$(echo "$value" | xargs)
+
+            # Remove any quotes
+            value=$(echo "$value" | tr -d '"')
+
+            # Add to key=value string
+            if [ "$first" = true ]; then
+                first=false
+            else
+                vars+=","
+            fi
+            vars+="${key}=${value}"
         done < "${env_file}"
-    else
-        echo "Warning: No .env file found for ${function_name}, skipping environment setup."
     fi
-    
-    echo "${env_vars[@]}"
+
+    echo "{${vars}}"
 }
 
 # Function to check if API Gateway exists
@@ -169,7 +178,7 @@ create_api_gateway() {
 # Function to manage API Gateway for a Lambda function
 manage_api_gateway() {
     local function_name=$1
-    local prefixed_function_name="${ENVIRONMENT}-${function_name}"
+    local prefixed_function_name="${ENVIRONMENT}_${function_name}"
     
     # Convert function name for API Gateway (replace _ with -)
     local api_name="${prefixed_function_name//_/-}"
@@ -271,11 +280,95 @@ deploy_with_zip() {
     rm -rf "${temp_dir}"
 }
 
+# Function to check if Lambda function exists
+check_function_exists() {
+    local function_name=$1
+    aws lambda get-function --function-name "${function_name}" >/dev/null 2>&1
+    return $?
+}
+
+# Function to create Lambda function
+create_lambda_function() {
+    local function_name=$1
+    local function_dir=$2
+    local env_vars=$3
+    local role_arn="arn:aws:iam::${AWS_ACCOUNT_ID}:role/lambda-role"  # Update this with your Lambda execution role
+
+    echo "Creating new Lambda function: ${function_name}"
+
+    if [[ -f "${function_dir}/Dockerfile" ]]; then
+        # For Docker-based functions
+        # First, build and push the image
+        local image_name="${function_name#dev_}"  # Remove 'dev_' prefix
+        local image_tag="${ENVIRONMENT}"
+        
+        # Ensure ECR repository exists
+        aws ecr describe-repositories --repository-names "${image_name}" || \
+            aws ecr create-repository --repository-name "${image_name}"
+        
+        # Login to ECR
+        aws ecr get-login-password --region "${AWS_REGION}" | \
+            docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+        
+        # Build and push image
+        docker build -t "${image_name}:${image_tag}" \
+            --build-arg FUNCTION_DIR="${function_name#dev_}" \
+            -f "${function_dir}/Dockerfile" .
+        docker tag "${image_name}:${image_tag}" "${ECR_REGISTRY}/${image_name}:${image_tag}"
+        docker push "${ECR_REGISTRY}/${image_name}:${image_tag}"
+
+        # Create Lambda function with container image
+        aws lambda create-function \
+            --function-name "${function_name}" \
+            --package-type Image \
+            --code ImageUri="${ECR_REGISTRY}/${image_name}:${image_tag}" \
+            --role "${role_arn}" \
+            --environment "Variables=${env_vars}" \
+            --timeout 900 \
+            --memory-size 2048
+
+        # Clean up local images
+        docker rmi "${image_name}:${image_tag}" "${ECR_REGISTRY}/${image_name}:${image_tag}"
+    else
+        # For ZIP-based functions
+        # Create temporary directory for packaging
+        local temp_dir=$(mktemp -d)
+        local zip_file="${temp_dir}/${function_name}.zip"
+        
+        # Copy function files
+        cp -r "${function_dir}"/* "${temp_dir}/"
+        
+        # Install dependencies
+        if [[ -f "${function_dir}/requirements.txt" ]]; then
+            pip install -r "${function_dir}/requirements.txt" -t "${temp_dir}/" --quiet
+        fi
+        
+        # Create ZIP
+        cd "${temp_dir}"
+        zip -r "${zip_file}" . -q
+        cd - > /dev/null
+        
+        # Create Lambda function with ZIP
+        aws lambda create-function \
+            --function-name "${function_name}" \
+            --runtime python3.12 \
+            --handler main.lambda_handler \
+            --role "${role_arn}" \
+            --environment "Variables=${env_vars}" \
+            --timeout 900 \
+            --memory-size 2048 \
+            --zip-file "fileb://${zip_file}"
+        
+        # Clean up
+        rm -rf "${temp_dir}"
+    fi
+}
+
 # Function to build and deploy a Lambda function
 deploy_function() {
     local function_name=$1
     local function_dir="functions/${function_name}"
-    local prefixed_function_name="${ENVIRONMENT}-${function_name}"
+    local prefixed_function_name="${ENVIRONMENT}_${function_name}"
     local image_name="${function_name}"
     local image_tag="${ENVIRONMENT}"
     
@@ -289,33 +382,31 @@ deploy_function() {
     echo "----------------------------------------"
     
     # Load environment variables
-    local env_vars=($(load_env_vars "${function_name}"))
+    local env_vars=$(load_env_vars "${function_name}")
+    echo "Environment variables: ${env_vars}"
     
-    # Update Lambda function with environment variables
-    echo "Updating Lambda function with environment variables..."
-    if [ ${#env_vars[@]} -gt 0 ]; then
-        # Convert env vars array to JSON format for AWS CLI
-        env_json="{"
-        for var in "${env_vars[@]}"; do
-            key="${var%%=*}"
-            value="${var#*=}"
-            env_json+="\"${key}\":\"${value}\","
-        done
-        env_json="${env_json%,}"  # Remove trailing comma
-        env_json+="}"
-        
-        aws lambda update-function-configuration \
-            --function-name "${prefixed_function_name}" \
-            --environment "Variables=${env_json}"
-    fi
-    
-    # Choose deployment method based on Dockerfile existence
-    if [[ -f "${function_dir}/Dockerfile" ]]; then
-        echo "Dockerfile found. Using Docker deployment..."
-        deploy_with_docker "${function_name}" "${function_dir}" "${prefixed_function_name}" "${image_name}" "${image_tag}"
+    # Check if function exists
+    if ! check_function_exists "${prefixed_function_name}"; then
+        echo "Lambda function ${prefixed_function_name} does not exist. Creating..."
+        create_lambda_function "${prefixed_function_name}" "${function_dir}" "${env_vars}"
     else
-        echo "No Dockerfile found. Using ZIP deployment..."
-        deploy_with_zip "${function_name}" "${function_dir}" "${prefixed_function_name}"
+        echo "Lambda function ${prefixed_function_name} exists. Updating..."
+        # Update Lambda function with environment variables if not empty
+        if [ "$env_vars" != "{}" ]; then
+            echo "Updating Lambda function with environment variables..."
+            aws lambda update-function-configuration \
+                --function-name "${prefixed_function_name}" \
+                --environment "Variables=${env_vars}"
+        fi
+        
+        # Choose deployment method based on Dockerfile existence
+        if [[ -f "${function_dir}/Dockerfile" ]]; then
+            echo "Dockerfile found. Using Docker deployment..."
+            deploy_with_docker "${function_name}" "${function_dir}" "${prefixed_function_name}" "${image_name}" "${image_tag}"
+        else
+            echo "No Dockerfile found. Using ZIP deployment..."
+            deploy_with_zip "${function_name}" "${function_dir}" "${prefixed_function_name}"
+        fi
     fi
     
     echo "${prefixed_function_name} deployed successfully"

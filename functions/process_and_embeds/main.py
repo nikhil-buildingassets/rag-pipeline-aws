@@ -3,7 +3,7 @@
 
 import json
 import os
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Union
 import fitz  # PyMuPDF
 from nltk.tokenize import sent_tokenize
 import nltk
@@ -25,27 +25,67 @@ except LookupError:
     nltk.download('punkt')
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    """AWS Lambda handler for processing PDF and generating embeddings."""
+    """AWS Lambda handler for processing files and generating embeddings."""
     try:
         # Extract parameters from event
-        pdf_content = event.get('pdf_content')
-        if not pdf_content:
+        file_content = event.get('content') or event.get('file_content')  # Support both keys
+        embedding_only = event.get('embedding_only', False)
+        
+        if not file_content:
             return {
                 'statusCode': 400,
                 'body': json.dumps({
                     'status': 'error',
-                    'message': 'pdf_content is required in the event payload'
+                    'message': 'file content is required in the event payload'
                 })
             }
 
-        # Initialize processor and process PDF
+        # Initialize processor
         processor = ProcessAndEmbed()
-        result = processor.process_pdf_bytes(pdf_content)
 
-        return {
-            'statusCode': 200 if result['status'] == 'success' else 500,
-            'body': json.dumps(result)
-        }
+        if embedding_only:
+            # For embedding only, we expect the content to be text
+            try:
+                # Try to decode as text first
+                if isinstance(file_content, bytes):
+                    text_content = file_content.decode('utf-8')
+                else:
+                    text_content = file_content
+                
+                # Generate embedding for the text content
+                embedding = processor.generate_single_embedding(text_content)
+                
+                return {
+                    'statusCode': 200,
+                    'body': json.dumps({
+                        'status': 'success',
+                        'embedding': embedding.tolist()
+                    })
+                }
+            except UnicodeDecodeError:
+                # If decode fails, treat as file
+                logger.info("Content appears to be binary, processing as file...")
+                result = processor.process_file_bytes(file_content)
+                if result['status'] == 'success' and result.get('embeddings'):
+                    # Return the first embedding if multiple were generated
+                    return {
+                        'statusCode': 200,
+                        'body': json.dumps({
+                            'status': 'success',
+                            'embedding': result['embeddings'][0]
+                        })
+                    }
+                return {
+                    'statusCode': 500,
+                    'body': json.dumps(result)
+                }
+        else:
+            # Process as file with full chunking and embeddings
+            result = processor.process_file_bytes(file_content)
+            return {
+                'statusCode': 200 if result['status'] == 'success' else 500,
+                'body': json.dumps(result)
+            }
 
     except Exception as e:
         logger.error(f"Error in lambda handler: {str(e)}")
@@ -97,11 +137,17 @@ class ProcessAndEmbed:
         text = re.sub(r'\s+', ' ', text)  # Remove multiple spaces
         return text.strip()
 
-    def extract_text_from_pdf_bytes(self, pdf_content: bytes) -> List[Dict]:
-        """Extract text from PDF bytes."""
+    def generate_single_embedding(self, text: str) -> np.ndarray:
+        """Generate embedding for a single text string."""
+        cleaned_text = self._clean_text(text)
+        embedding = self.model.encode([cleaned_text], normalize_embeddings=True)[0]
+        return embedding
+
+    def extract_text_from_file_bytes(self, file_content: bytes) -> List[Dict]:
+        """Extract text from file bytes."""
         try:
-            logger.info("Processing PDF from bytes")
-            doc = fitz.open(stream=pdf_content, filetype="pdf")
+            logger.info("Processing file from bytes")
+            doc = fitz.open(stream=file_content, filetype="file")
             self.text_chunks = []
             
             for page_num, page in enumerate(doc):
@@ -136,7 +182,7 @@ class ProcessAndEmbed:
             return self.text_chunks
             
         except Exception as e:
-            logger.error(f"Error extracting text from PDF: {str(e)}")
+            logger.error(f"Error extracting text from file: {str(e)}")
             raise
         finally:
             if 'doc' in locals():
@@ -219,15 +265,15 @@ class ProcessAndEmbed:
         logger.info(f"Generated embeddings of shape {self.embeddings.shape}")
         return self.embeddings
 
-    def process_pdf_bytes(self, pdf_content: bytes) -> Dict[str, Any]:
-        """Process PDF bytes and return chunks and embeddings."""
+    def process_file_bytes(self, file_content: bytes) -> Dict[str, Any]:
+        """Process file bytes and return chunks and embeddings."""
         try:
-            # Extract text from PDF
-            logger.info("Extracting text from PDF...")
-            self.extract_text_from_pdf_bytes(pdf_content)
+            # Extract text from file
+            logger.info("Extracting text from file...")
+            self.extract_text_from_file_bytes(file_content)
             
             if not self.text_chunks:
-                raise ValueError("No text was extracted from the PDF!")
+                raise ValueError("No text was extracted from the file!")
             
             # Create semantic chunks
             logger.info("Creating semantic chunks...")
@@ -245,12 +291,12 @@ class ProcessAndEmbed:
                 'stats': {
                     'num_chunks': len(self.chunked_docs),
                     'embedding_dim': self.embeddings.shape[1] if self.embeddings is not None else None,
-                    'pdf_size_bytes': len(pdf_content)
+                    'file_size_bytes': len(file_content)
                 }
             }
             
         except Exception as e:
-            logger.error(f"Error processing PDF: {str(e)}")
+            logger.error(f"Error processing file: {str(e)}")
             return {
                 'status': 'error',
                 'error': str(e)
