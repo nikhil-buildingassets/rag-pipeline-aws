@@ -29,6 +29,8 @@ pinecone.init(
     environment=os.getenv('PINECONE_ENVIRONMENT', 'us-west1-gcp')
 )
 
+PINECONE_INDEX_NAME = f"{os.getenv('ENVIRONMENT')}_{os.getenv('PINECONE_INDEX_NAME')}"
+
 LAMBDA_FUNCTIONS = {
     'embed': 'process_and_embeds',
     'process': 'file_processor',
@@ -113,15 +115,37 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
 class RAGPipeline:
     def __init__(self):
-        self.index_name = os.getenv('PINECONE_INDEX_NAME', 'rag-pipeline')
-        # Create index if it doesn't exist
-        if self.index_name not in pinecone.list_indexes():
-            pinecone.create_index(
-                name=self.index_name,
-                dimension=384,  # Update this based on your embedding model dimension
-                metric='cosine'
-            )
+        self.index_name = PINECONE_INDEX_NAME
+        self._ensure_index_exists()
         self.index = pinecone.Index(self.index_name)
+    
+    def _ensure_index_exists(self):
+        """Ensure the Pinecone index exists, create it if it doesn't."""
+        try:
+            # Check if index exists
+            existing_indexes = pinecone.list_indexes()
+            logger.info(f"Existing Pinecone indexes: {existing_indexes}")
+            
+            if self.index_name not in existing_indexes:
+                logger.info(f"Creating Pinecone index: {self.index_name}")
+                pinecone.create_index(
+                    name=self.index_name,
+                    dimension=384,  # Update this based on your embedding model dimension
+                    metric='cosine'
+                )
+                
+                # Wait for index to be ready
+                logger.info(f"Waiting for index {self.index_name} to be ready...")
+                while not pinecone.describe_index(self.index_name).status['ready']:
+                    import time
+                    time.sleep(1)
+                logger.info(f"Index {self.index_name} is ready")
+            else:
+                logger.info(f"Index {self.index_name} already exists")
+                
+        except Exception as e:
+            logger.error(f"Error ensuring Pinecone index exists: {str(e)}")
+            raise
 
     def _save_chunks_to_s3(self, bucket: str, prefix: str, chunks: List[Dict]) -> str:
         """Save chunks data to S3 and return the S3 path."""

@@ -253,9 +253,9 @@ deploy_with_zip() {
     local temp_dir=$(mktemp -d)
     local zip_file="${temp_dir}/${function_name}.zip"
     
-    # Copy function files to temp directory
+    # Copy function files to temp directory (excluding venv)
     echo "Packaging function files..."
-    cp -r "${function_dir}"/* "${temp_dir}/"
+    rsync -av --exclude='venv' "${function_dir}/" "${temp_dir}/"
     
     # Install dependencies if requirements.txt exists
     if [[ -f "${function_dir}/requirements.txt" ]]; then
@@ -335,8 +335,8 @@ create_lambda_function() {
         local temp_dir=$(mktemp -d)
         local zip_file="${temp_dir}/${function_name}.zip"
         
-        # Copy function files
-        cp -r "${function_dir}"/* "${temp_dir}/"
+        # Copy function files (excluding venv)
+        rsync -av --exclude='venv' "${function_dir}/" "${temp_dir}/"
         
         # Install dependencies
         if [[ -f "${function_dir}/requirements.txt" ]]; then

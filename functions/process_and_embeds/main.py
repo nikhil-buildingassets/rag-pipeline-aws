@@ -1,6 +1,3 @@
-# takes file byte data and process the file
-# extract, clean, and embedd, vectorize and return vectors
-
 import json
 import os
 from typing import List, Dict, Optional, Any, Union
@@ -17,6 +14,12 @@ logger.setLevel(logging.INFO)
 
 # Set tokenizers parallelism to avoid warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+try:
+    MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+except Exception as e:
+    logger.error(f"Failed to load model: {str(e)}")
+    raise
 
 # Download required NLTK data
 try:
@@ -103,14 +106,6 @@ class ProcessAndEmbed:
         self.text_chunks: List[Dict] = []
         self.chunked_docs: List[Dict] = []
         self.embeddings: Optional[np.ndarray] = None
-        
-        # Initialize the model
-        try:
-            self.model = SentenceTransformer('all-MiniLM-L6-v2')  # Default model
-            logger.info(f"Initialized model: all-MiniLM-L6-v2")
-        except Exception as e:
-            logger.error(f"Failed to load model: {str(e)}")
-            raise
 
     def _clean_text(self, text: str) -> str:
         """Clean and normalize extracted text."""
@@ -140,7 +135,7 @@ class ProcessAndEmbed:
     def generate_single_embedding(self, text: str) -> np.ndarray:
         """Generate embedding for a single text string."""
         cleaned_text = self._clean_text(text)
-        embedding = self.model.encode([cleaned_text], normalize_embeddings=True)[0]
+        embedding = MODEL.encode([cleaned_text], normalize_embeddings=True)[0]
         return embedding
 
     def extract_text_from_file_bytes(self, file_content: bytes) -> List[Dict]:
@@ -258,7 +253,7 @@ class ProcessAndEmbed:
         all_embeddings = []
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]
-            batch_embeddings = self.model.encode(batch, show_progress_bar=True, normalize_embeddings=True)
+            batch_embeddings = MODEL.encode(batch, show_progress_bar=True, normalize_embeddings=True)
             all_embeddings.append(batch_embeddings)
             
         self.embeddings = np.vstack(all_embeddings)
