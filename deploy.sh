@@ -292,7 +292,7 @@ create_lambda_function() {
     local function_name=$1
     local function_dir=$2
     local env_vars=$3
-    local role_arn="arn:aws:iam::${AWS_ACCOUNT_ID}:role/lambda-role"  # Update this with your Lambda execution role
+    local role_arn="arn:aws:iam::${AWS_ACCOUNT_ID}:role/LambdaAccess"
 
     echo "Creating new Lambda function: ${function_name}"
 
