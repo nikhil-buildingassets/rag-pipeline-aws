@@ -168,25 +168,58 @@ The deployment script supports separate development and production environments:
 
 ### API Gateway Integration
 
-The deployment script automatically manages API Gateway for each Lambda function:
+The deployment script automatically manages a **shared API Gateway** for all Lambda functions:
 
 #### Features
-- **Automatic Creation**: Creates API Gateway if it doesn't exist
-- **Smart Naming**: Converts function names (replaces `_` with `-` for API Gateway compatibility)
-- **Skip Logic**: Skips API Gateway creation on redeployment if already exists
+- **Single API Gateway**: One shared API Gateway for all functions across environments
+- **Environment-Based Routing**: Functions are accessible via `/dev/` and `/prod/` paths
+- **Automatic Creation**: Creates shared API Gateway if it doesn't exist
+- **Smart Routing**: Automatically adds function routes to the shared API Gateway
 - **Proxy Integration**: Sets up `{proxy+}` resources for flexible routing
-- **Permissions**: Automatically grants API Gateway permission to invoke Lambda
+- **Permissions**: Automatically grants API Gateway permission to invoke Lambda functions
+
+#### API Gateway Structure
+```
+Shared API Gateway: buildingassets-api
+├── /dev/
+│   ├── /function1 → dev_function1 Lambda
+│   ├── /function2 → dev_function2 Lambda
+│   └── /function3 → dev_function3 Lambda
+└── /prod/
+    ├── /function1 → prod_function1 Lambda
+    ├── /function2 → prod_function2 Lambda
+    └── /function3 → prod_function3 Lambda
+```
 
 #### API Gateway URLs
-After deployment, each function gets an API Gateway endpoint:
+After deployment, all functions are accessible through the shared API Gateway:
+
+**Base URLs:**
 ```
-https://{api-id}.execute-api.{region}.amazonaws.com/{environment}
+https://{api-id}.execute-api.{region}.amazonaws.com/dev
+https://{api-id}.execute-api.{region}.amazonaws.com/prod
 ```
 
-Example:
+**Function Endpoints:**
 ```
-https://abc123def456.execute-api.us-east-1.amazonaws.com/dev
+https://{api-id}.execute-api.{region}.amazonaws.com/dev/{function-name}
+https://{api-id}.execute-api.{region}.amazonaws.com/prod/{function-name}
 ```
+
+**Examples:**
+```
+https://abc123def456.execute-api.us-east-1.amazonaws.com/dev/file_processor
+https://abc123def456.execute-api.us-east-1.amazonaws.com/prod/rag_pipeline
+```
+
+#### Benefits of Shared API Gateway
+- **Cost Optimization**: Single API Gateway instead of one per function
+- **Simplified Management**: Centralized API management
+- **Consistent URLs**: Predictable endpoint structure (`/dev/function-name`, `/prod/function-name`)
+- **Environment Isolation**: Clear separation between dev and prod
+- **Easier Integration**: Single base URL for client applications
+- **Better Performance**: Direct function routing without proxy overhead
+- **Clearer Structure**: Each function has its own dedicated endpoint
 
 ### Deployment Process
 

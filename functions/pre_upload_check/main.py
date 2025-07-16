@@ -9,6 +9,9 @@ import logging
 s3 = boto3.client('s3')
 lambda_client = boto3.client('lambda')
 
+ENVIRONMENT = os.environ.get("ENVIRONMENT", "dev")
+FILE_STORAGE_BUCKET_PREFIX = f'{ENVIRONMENT}_buildingassets'
+
 LAMBDA_FUNCTIONS = {
     'embed': 'process_and_embeds',
     'processor': 'file_processor'
@@ -152,7 +155,6 @@ def lambda_handler(event, context):
         "file_key": "path/to/file",
         "file_content": "base64_encoded_content",
         "replace_if_exists": false,
-        "org_folder": "organization_folder_name"  # Added this field
     }
     """
     try:
@@ -161,11 +163,6 @@ def lambda_handler(event, context):
         file_key = event['file_key']
         file_content_base64 = event['file_content']
         replace_if_exists = event.get('replace_if_exists', False)
-        org_folder = event.get('org_folder')
-        
-        # If org_folder is provided, prepend it to the file_key
-        if org_folder:
-            file_key = f"{org_folder}/{file_key}"
         
         # Decode base64 file content
         try:
@@ -178,6 +175,8 @@ def lambda_handler(event, context):
                     'details': str(e)
                 })
             }
+        
+        file_key = f'{FILE_STORAGE_BUCKET_PREFIX}/{file_key}'
         
         # Get file name and prefix
         file_name = os.path.basename(file_key)
@@ -202,6 +201,8 @@ def lambda_handler(event, context):
         
         # Get embeddings for existing files
         existing_files_data = get_existing_file_embeddings(bucket, existing_files)
+
+        print(existing_files_data)
         
         # Check for similar content
         similar_files = find_similar_files(file_content, existing_files_data)

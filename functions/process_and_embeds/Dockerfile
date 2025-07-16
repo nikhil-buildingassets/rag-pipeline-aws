@@ -1,20 +1,36 @@
-# Use AWS Lambda Python runtime as base image
+# Stage 1: Build layer with dependencies
+FROM public.ecr.aws/lambda/python:3.12 AS builder
+
+WORKDIR /build
+
+COPY functions/process_and_embeds/requirements.txt .
+
+RUN pip install --upgrade pip \
+    && pip install --no-cache-dir --target python -r requirements.txt
+
+# Stage 2: Download model
+FROM public.ecr.aws/lambda/python:3.12 AS model-downloader
+
+WORKDIR /model
+
+# Copy requirements and install dependencies
+COPY functions/process_and_embeds/requirements.txt .
+RUN pip install --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
+
+# Copy the download script and run it
+COPY functions/process_and_embeds/download_model.py .
+RUN python download_model.py
+
+# Stage 3: Final image
 FROM public.ecr.aws/lambda/python:3.12
 
-# Install system dependencies for PyMuPDF
-RUN yum install -y \
-    mupdf \
-    mupdf-tools \
-    && yum clean all
+COPY --from=builder /build/python ${LAMBDA_TASK_ROOT}
 
-# Copy requirements file
-COPY functions/process_and_embeds/requirements.txt ${LAMBDA_TASK_ROOT}
+# Copy the pre-downloaded model
+COPY --from=model-downloader /model/my_model ${LAMBDA_TASK_ROOT}/my_model
 
-# Install Python dependencies
-RUN pip install -r requirements.txt --no-cache-dir
-
-# Copy function code
 COPY functions/process_and_embeds/main.py ${LAMBDA_TASK_ROOT}
 
-# Set the CMD to your handler
-CMD [ "main.lambda_handler" ] 
+# Command to run the Lambda function
+CMD [ "main.lambda_handler" ]

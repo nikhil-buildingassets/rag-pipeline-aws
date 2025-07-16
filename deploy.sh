@@ -7,6 +7,34 @@ set -e
 ENVIRONMENT="dev"
 SPECIFIC_FUNCTION=""
 
+# AWS account and region configuration
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+AWS_REGION=$(aws configure get region)
+ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+# API and project configuration
+API_NAME="buildingassets-api"
+PROJECT_NAME="Building Assets"
+
+# Function to cleanup temporary files
+cleanup() {
+    if [[ -f ".api_gateway_id" ]]; then
+        rm -f .api_gateway_id
+    fi
+}
+
+# Set trap to cleanup on exit
+trap cleanup EXIT
+
+# Check if jq is available
+if ! command -v jq &> /dev/null; then
+    echo "Error: jq is required but not installed. Please install jq to continue."
+    echo "On macOS: brew install jq"
+    echo "On Ubuntu/Debian: sudo apt-get install jq"
+    echo "On CentOS/RHEL: sudo yum install jq"
+    exit 1
+fi
+
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -38,11 +66,6 @@ echo "Deploying to ${ENVIRONMENT} environment"
 if [[ -n "${SPECIFIC_FUNCTION}" ]]; then
     echo "Deploying specific function: ${SPECIFIC_FUNCTION}"
 fi
-
-# AWS account and region configuration
-AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-AWS_REGION=$(aws configure get region)
-ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
 # Function to load environment variables from .env file
 load_env_vars() {
@@ -77,125 +100,243 @@ load_env_vars() {
     echo "{${vars}}"
 }
 
-# Function to check if API Gateway exists
-check_api_gateway_exists() {
-    local api_name=$1
-    local api_id=$(aws apigateway get-rest-apis --query "items[?name=='${api_name}'].id" --output text)
+# Function to check if shared HTTP API exists
+check_shared_http_api_exists() {
+    local api_name="${API_NAME}"
+    local api_id=$(aws apigatewayv2 get-apis --query "Items[?Name=='${api_name}'].ApiId" --output text)
     
     if [[ -n "$api_id" && "$api_id" != "None" ]]; then
-        echo "$api_id"
-        return 0
+        # Validate that the HTTP API is accessible
+        if aws apigatewayv2 get-api --api-id "${api_id}" >/dev/null 2>&1; then
+            echo "$api_id"
+            return 0
+        else
+            echo "Found broken HTTP API ${api_id}, will recreate..." >&2
+            # Delete the broken HTTP API
+            aws apigatewayv2 delete-api --api-id "${api_id}" 2>/dev/null || true
+            return 1
+        fi
     else
         return 1
     fi
 }
 
-# Function to create API Gateway
-create_api_gateway() {
-    local api_name=$1
-    local lambda_function_name=$2
+# Function to create shared HTTP API
+create_shared_http_api() {
+    local api_name="${API_NAME}"
     
-    echo "Creating API Gateway: ${api_name}"
+    echo "Creating shared HTTP API: ${api_name}"
     
-    # Create the REST API
-    local api_id=$(aws apigateway create-rest-api \
+    # Create the HTTP API
+    local api_id=$(aws apigatewayv2 create-api \
         --name "${api_name}" \
-        --description "API for ${lambda_function_name}" \
-        --endpoint-configuration types=REGIONAL \
-        --query 'id' --output text)
+        --description "Shared HTTP API for ${PROJECT_NAME} to manage the Lambda functions endpoints" \
+        --protocol-type HTTP \
+        --cors-configuration '{
+            "AllowMethods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+            "AllowOrigins": ["*"],
+            "AllowHeaders": ["*"],
+            "MaxAge": 86400
+        }' \
+        --query 'ApiId' --output text)
     
-    echo "Created API Gateway with ID: ${api_id}"
+    echo "Created shared HTTP API with ID: ${api_id}"
     
-    # Get the root resource ID
-    local root_resource_id=$(aws apigateway get-resources \
-        --rest-api-id "${api_id}" \
-        --query 'items[0].id' --output text)
+    # Store API ID for later use
+    echo "${api_id}" > .api_gateway_id
     
-    # Create a proxy resource ({proxy+})
-    local proxy_resource_id=$(aws apigateway create-resource \
-        --rest-api-id "${api_id}" \
-        --parent-id "${root_resource_id}" \
-        --path-part "{proxy+}" \
-        --query 'id' --output text)
-    
-    # Create ANY method on the proxy resource
-    aws apigateway put-method \
-        --rest-api-id "${api_id}" \
-        --resource-id "${proxy_resource_id}" \
-        --http-method ANY \
-        --authorization-type NONE
-    
-    # Create integration with Lambda
-    local lambda_arn="arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${lambda_function_name}"
-    local integration_uri="arn:aws:apigateway:${AWS_REGION}:lambda:path/2015-03-31/functions/${lambda_arn}/invocations"
-    
-    aws apigateway put-integration \
-        --rest-api-id "${api_id}" \
-        --resource-id "${proxy_resource_id}" \
-        --http-method ANY \
-        --type AWS_PROXY \
-        --integration-http-method POST \
-        --uri "${integration_uri}"
-    
-    # Create ANY method on the root resource
-    aws apigateway put-method \
-        --rest-api-id "${api_id}" \
-        --resource-id "${root_resource_id}" \
-        --http-method ANY \
-        --authorization-type NONE
-    
-    # Create integration with Lambda for root resource
-    aws apigateway put-integration \
-        --rest-api-id "${api_id}" \
-        --resource-id "${root_resource_id}" \
-        --http-method ANY \
-        --type AWS_PROXY \
-        --integration-http-method POST \
-        --uri "${integration_uri}"
-    
-    # Grant API Gateway permission to invoke Lambda
-    aws lambda add-permission \
-        --function-name "${lambda_function_name}" \
-        --statement-id "apigateway-invoke-${api_name}" \
-        --action lambda:InvokeFunction \
-        --principal apigateway.amazonaws.com \
-        --source-arn "arn:aws:execute-api:${AWS_REGION}:${AWS_ACCOUNT_ID}:${api_id}/*/*" \
-        --region "${AWS_REGION}" || echo "Permission may already exist"
-    
-    # Deploy the API
-    local deployment_id=$(aws apigateway create-deployment \
-        --rest-api-id "${api_id}" \
-        --stage-name "${ENVIRONMENT}" \
-        --stage-description "Deployment for ${ENVIRONMENT} environment" \
-        --query 'id' --output text)
-    
-    echo "API Gateway deployed with deployment ID: ${deployment_id}"
-    echo "API Gateway URL: https://${api_id}.execute-api.${AWS_REGION}.amazonaws.com/${ENVIRONMENT}"
+    echo "Shared HTTP API created successfully"
+    echo "HTTP API URL: https://${api_id}.execute-api.${AWS_REGION}.amazonaws.com"
     
     return 0
 }
 
-# Function to manage API Gateway for a Lambda function
-manage_api_gateway() {
+# Function to get or create shared HTTP API
+get_or_create_shared_http_api() {
+    local api_id
+    
+    # Always check for existing HTTP API first
+    if api_id=$(check_shared_http_api_exists); then
+        echo "Shared HTTP API already exists with ID: ${api_id}" >&2
+        echo "${api_id}" > .api_gateway_id
+    else
+        echo "Shared HTTP API does not exist. Creating..." >&2
+        create_shared_http_api
+        # Read the API ID from the file that was just created
+        if [[ -f ".api_gateway_id" ]]; then
+            api_id=$(cat .api_gateway_id)
+        else
+            echo "Error: Failed to create HTTP API or retrieve API ID" >&2
+            return 1
+        fi
+    fi
+    
+    echo "${api_id}"
+}
+
+# Function to add function route to shared HTTP API
+add_function_route() {
+    local function_name=$1
+    local prefixed_function_name=$2
+    local api_id=$3
+    
+    echo "Adding route for function: ${function_name}"
+    
+    # Wait a moment for resources to be available
+    sleep 5
+    
+    # Create route path for the function
+    local route_path="/${function_name}"
+    
+    # Check if integration already exists by looking for any integration with this Lambda
+    local integration_id
+    local integration_exists=$(aws apigatewayv2 get-integrations --api-id "${api_id}" --query "Items[?IntegrationUri=='arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${prefixed_function_name}'].IntegrationId" --output text)
+    
+    if [[ -z "${integration_exists}" || "${integration_exists}" == "None" ]]; then
+        echo "Creating Lambda integration for ${prefixed_function_name}"
+        
+        # Create the integration
+        integration_id=$(aws apigatewayv2 create-integration \
+            --api-id "${api_id}" \
+            --integration-type AWS_PROXY \
+            --integration-uri "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${prefixed_function_name}" \
+            --payload-format-version "2.0" \
+            --query 'IntegrationId' --output text)
+        
+        if [[ -z "${integration_id}" || "${integration_id}" == "None" ]]; then
+            echo "❌ Failed to create integration"
+            return 1
+        fi
+        
+        echo "✅ Created integration ID: ${integration_id}"
+    else
+        echo "✅ Lambda integration already exists: ${integration_exists}"
+        integration_id="${integration_exists}"
+    fi
+    
+    # Check if route already exists
+    local route_exists=$(aws apigatewayv2 get-routes --api-id "${api_id}" --query "Items[?RouteKey=='ANY ${route_path}'].RouteId" --output text)
+    
+    if [[ -z "${route_exists}" || "${route_exists}" == "None" ]]; then
+        echo "Creating route: ANY ${route_path}"
+        
+        # Create the route using the actual integration ID
+        local route_id=$(aws apigatewayv2 create-route \
+            --api-id "${api_id}" \
+            --route-key "ANY ${route_path}" \
+            --target "integrations/${integration_id}" \
+            --query 'RouteId' --output text)
+        
+        if [[ -z "${route_id}" || "${route_id}" == "None" ]]; then
+            echo "❌ Failed to create route"
+            return 1
+        fi
+        
+        echo "✅ Created route ID: ${route_id}"
+    else
+        echo "✅ Route already exists: ${route_exists}"
+    fi
+    
+    # Grant HTTP API permission to invoke Lambda
+    echo "Granting Lambda permission..."
+    aws lambda add-permission \
+        --function-name "${prefixed_function_name}" \
+        --statement-id "apigatewayv2-invoke-${function_name}-${ENVIRONMENT}" \
+        --action lambda:InvokeFunction \
+        --principal apigateway.amazonaws.com \
+        --source-arn "arn:aws:execute-api:${AWS_REGION}:${AWS_ACCOUNT_ID}:${api_id}/${ENVIRONMENT}/*" \
+        --region "${AWS_REGION}" || echo "⚠️ Permission may already exist"
+    
+    echo "✅ Function route added successfully"
+    echo "🌐 Function endpoint: https://${api_id}.execute-api.${AWS_REGION}.amazonaws.com${route_path}"
+}
+
+# Function to deploy shared HTTP API
+deploy_shared_http_api() {
+    local api_id=$1
+    
+    echo "Deploying shared HTTP API..."
+    
+    # Create stage
+    local stage_exists=$(aws apigatewayv2 get-stages --api-id "${api_id}" --query "Items[?StageName=='${ENVIRONMENT}'].StageName" --output text)
+    
+    if [[ -z "${stage_exists}" || "${stage_exists}" == "None" ]]; then
+        echo "Creating stage: ${ENVIRONMENT}"
+        aws apigatewayv2 create-stage \
+            --api-id "${api_id}" \
+            --stage-name "${ENVIRONMENT}" \
+            --auto-deploy
+    else
+        echo "Stage ${ENVIRONMENT} already exists"
+    fi
+    
+    # Deploy the API to the stage
+    echo "Deploying API to stage: ${ENVIRONMENT}"
+    local deployment_id=$(aws apigatewayv2 create-deployment \
+        --api-id "${api_id}" \
+        --description "Deployment for ${ENVIRONMENT} environment" \
+        --query 'DeploymentId' --output text)
+    
+    echo "✅ Deployment created with ID: ${deployment_id}"
+    
+    # Wait for deployment to complete
+    echo "⏳ Waiting for deployment to complete..."
+    sleep 15
+    
+    # Verify stage is accessible
+    echo "🔍 Verifying stage deployment..."
+    local stage_info=$(aws apigatewayv2 get-stage --api-id "${api_id}" --stage-name "${ENVIRONMENT}" --query 'StageName' --output text)
+    if [[ "${stage_info}" == "${ENVIRONMENT}" ]]; then
+        echo "✅ Stage ${ENVIRONMENT} is deployed and accessible"
+    else
+        echo "❌ Stage deployment verification failed"
+    fi
+    
+    echo "HTTP API deployed successfully"
+    echo "HTTP API URL: https://${api_id}.execute-api.${AWS_REGION}.amazonaws.com/${ENVIRONMENT}"
+    
+    return 0
+}
+
+# Function to manage shared HTTP API for a Lambda function
+manage_shared_http_api() {
     local function_name=$1
     local prefixed_function_name="${ENVIRONMENT}_${function_name}"
     
-    # Convert function name for API Gateway (replace _ with -)
-    local api_name="${prefixed_function_name//_/-}"
+    echo "Managing shared HTTP API for ${prefixed_function_name}..."
     
-    echo "Managing API Gateway for ${prefixed_function_name}..."
-    echo "API Gateway name: ${api_name}"
+    # Get or create shared HTTP API
+    local api_id=$(get_or_create_shared_http_api)
     
-    # Check if API Gateway already exists
-    if api_id=$(check_api_gateway_exists "${api_name}"); then
-        echo "API Gateway '${api_name}' already exists with ID: ${api_id}"
-        echo "Skipping API Gateway creation as it's already attached to Lambda"
-    else
-        echo "API Gateway '${api_name}' does not exist. Creating..."
-        create_api_gateway "${api_name}" "${prefixed_function_name}"
+    if [[ -z "${api_id}" ]]; then
+        echo "Error: Failed to get or create HTTP API"
+        return 1
     fi
     
-    echo "API Gateway management completed for ${prefixed_function_name}"
+    # Validate that the HTTP API exists and is accessible
+    if ! aws apigatewayv2 get-api --api-id "${api_id}" >/dev/null 2>&1; then
+        echo "Error: HTTP API ${api_id} is not accessible. Removing cached ID and retrying..."
+        rm -f .api_gateway_id
+        api_id=$(get_or_create_shared_http_api)
+        
+        if [[ -z "${api_id}" ]]; then
+            echo "Error: Failed to get or create HTTP API after retry"
+            return 1
+        fi
+    fi
+    
+    echo "Using HTTP API ID: ${api_id}"
+    
+    # Add function route to the shared HTTP API
+    if ! add_function_route "${function_name}" "${prefixed_function_name}" "${api_id}"; then
+        echo "Error: Failed to add function route"
+        return 1
+    fi
+    
+    # Deploy the HTTP API
+    deploy_shared_http_api "${api_id}"
+
+    sleep 10
     echo "----------------------------------------"
 }
 
@@ -221,7 +362,9 @@ deploy_with_docker() {
     
     # Build Docker image
     echo "Building Docker image for ${prefixed_function_name}..."
-    docker build -t "${image_name}:${image_tag}" \
+    BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker build \
+        --platform linux/amd64 \
+        -t "${image_name}:${image_tag}" \
         --build-arg FUNCTION_DIR="${function_name}" \
         -f "${function_dir}/Dockerfile" .
     
@@ -287,6 +430,35 @@ check_function_exists() {
     return $?
 }
 
+# Function to configure CloudWatch logging for Lambda function
+configure_lambda_logging() {
+    local function_name=$1
+    
+    echo "📊 Configuring CloudWatch logging for ${function_name}..."
+    
+    # Create log group if it doesn't exist
+    local log_group_name="/aws/lambda/${function_name}"
+    local log_group_exists=$(aws logs describe-log-groups --log-group-name-prefix "${log_group_name}" --query "logGroups[?logGroupName=='${log_group_name}'].logGroupName" --output text)
+    
+    if [[ -z "${log_group_exists}" || "${log_group_exists}" == "None" ]]; then
+        echo "Creating CloudWatch log group: ${log_group_name}"
+        aws logs create-log-group --log-group-name "${log_group_name}"
+        
+    else
+        echo "CloudWatch log group already exists: ${log_group_name}"
+    fi
+    
+    # Update Lambda function to include logging configuration
+    echo "Updating Lambda function with logging configuration..."
+    aws lambda update-function-configuration \
+        --function-name "${function_name}" \
+        --tracing-config Mode=Active || echo "⚠️ Tracing configuration may not be supported or already set"
+    
+    echo "✅ CloudWatch logging configured for ${function_name}"
+    echo "📋 Log group: ${log_group_name}"
+    echo "🔗 View logs: https://${AWS_REGION}.console.aws.amazon.com/cloudwatch/home?region=${AWS_REGION}#logsV2:log-groups/log-group/${log_group_name//\//\$252F}"
+}
+
 # Function to create Lambda function
 create_lambda_function() {
     local function_name=$1
@@ -311,13 +483,19 @@ create_lambda_function() {
             docker login --username AWS --password-stdin "${ECR_REGISTRY}"
         
         # Build and push image
-        docker build -t "${image_name}:${image_tag}" \
-            --build-arg FUNCTION_DIR="${function_name#dev_}" \
+        echo "🐳 Building Docker image: ${image_name}:${image_tag}"
+        BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker build \
+            --platform linux/amd64 \
+            -t "${image_name}:${image_tag}" \
+            --build-arg FUNCTION_DIR="${function_name}" \
             -f "${function_dir}/Dockerfile" .
+
+        echo "🐳 Pushing Docker image: ${image_name}:${image_tag}"
         docker tag "${image_name}:${image_tag}" "${ECR_REGISTRY}/${image_name}:${image_tag}"
         docker push "${ECR_REGISTRY}/${image_name}:${image_tag}"
 
         # Create Lambda function with container image
+        echo "🚀 Creating Lambda function with image: ${ECR_REGISTRY}/${image_name}:${image_tag}"
         aws lambda create-function \
             --function-name "${function_name}" \
             --package-type Image \
@@ -325,7 +503,10 @@ create_lambda_function() {
             --role "${role_arn}" \
             --environment "Variables=${env_vars}" \
             --timeout 900 \
-            --memory-size 2048
+            --memory-size 2048 || {
+                echo "❌ Failed to create Lambda function"
+                return 1
+            }
 
         # Clean up local images
         docker rmi "${image_name}:${image_tag}" "${ECR_REGISTRY}/${image_name}:${image_tag}"
@@ -362,6 +543,9 @@ create_lambda_function() {
         # Clean up
         rm -rf "${temp_dir}"
     fi
+    
+    # Configure CloudWatch logging after function creation
+    configure_lambda_logging "${function_name}"
 }
 
 # Function to build and deploy a Lambda function
@@ -407,13 +591,16 @@ deploy_function() {
             echo "No Dockerfile found. Using ZIP deployment..."
             deploy_with_zip "${function_name}" "${function_dir}" "${prefixed_function_name}"
         fi
+        
+        # Ensure CloudWatch logging is configured for existing functions
+        configure_lambda_logging "${prefixed_function_name}"
     fi
     
     echo "${prefixed_function_name} deployed successfully"
     echo "----------------------------------------"
     
-    # Manage API Gateway for this function
-    manage_api_gateway "${function_name}"
+    # Manage HTTP API for this function
+    manage_shared_http_api "${function_name}"
 }
 
 # Get list of all function directories or validate specific function
@@ -448,7 +635,14 @@ for function_name in "${functions[@]}"; do
 done
 
 if [[ -n "${SPECIFIC_FUNCTION}" ]]; then
-    echo "Function ${SPECIFIC_FUNCTION} deployed successfully with API Gateway endpoint"
+    echo "Function ${SPECIFIC_FUNCTION} deployed successfully with shared API Gateway endpoint"
+    echo ""
+    echo "📊 To view CloudWatch logs for this function:"
+    echo "aws logs tail /aws/lambda/${ENVIRONMENT}_${SPECIFIC_FUNCTION} --follow"
+    echo "Or visit: https://${AWS_REGION}.console.aws.amazon.com/cloudwatch/home?region=${AWS_REGION}#logsV2:log-groups/log-group/%252Faws%252Flambda%252F${ENVIRONMENT}_${SPECIFIC_FUNCTION}"
 else
-    echo "All functions deployed successfully with API Gateway endpoints"
+    echo "All functions deployed successfully with shared API Gateway endpoints"
+    echo ""
+    echo "📊 To view CloudWatch logs for all functions:"
+    echo "aws logs tail /aws/lambda/${ENVIRONMENT}_* --follow"
 fi

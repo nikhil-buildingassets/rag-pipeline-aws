@@ -17,7 +17,7 @@ s3_client = boto3.client('s3')
 lambda_client = boto3.client('lambda')
 
 LAMBDA_FUNCTIONS = {
-    'rag': 'rag_pipeline',
+    'embed_and_index': 'embed_and_index',
     'measure': 'measures_extraction',
     'equipment': 'equipment_extraction',
     'utility': 'utility_extraction'
@@ -49,31 +49,6 @@ def get_file_from_s3(bucket: str, key: str) -> Tuple[bytes, str]:
         return file_content, filename
     except Exception as e:
         logger.error(f"Error fetching file from S3: {str(e)}")
-        raise
-
-def invoke_rag_pipeline_lambda(file_content: bytes, bucket: str, key: str) -> Dict[str, Any]:
-    """Invoke the rag_pipeline Lambda function."""
-    try:
-        logger.info("Invoking rag_pipeline Lambda")
-        response = lambda_client.invoke(
-            FunctionName=get_function_name('rag'),
-            InvocationType='RequestResponse',
-            Payload=json.dumps({
-                'file_content': file_content.decode('latin1'),  # Convert bytes to string for JSON serialization
-                'bucket': bucket,
-                'key': key
-            })
-        )
-        
-        # Parse the response
-        response_payload = json.loads(response['Payload'].read())
-        if response['StatusCode'] != 200:
-            raise Exception(f"rag_pipeline Lambda failed: {response_payload}")
-            
-        return json.loads(response_payload['body'])
-        
-    except Exception as e:
-        logger.error(f"Error invoking rag_pipeline Lambda: {str(e)}")
         raise
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -108,7 +83,12 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         
         # Step 2: Invoke RAG pipeline to process file and save vectors
         logger.info("Step 2: Invoking RAG pipeline")
-        rag_result = invoke_rag_pipeline_lambda(file_content, bucket, key)
+        rag_payload = {
+            'file_content': file_content.decode('latin1'),  # Convert bytes to string for JSON serialization
+            'bucket': bucket,
+            'key': key
+        }
+        rag_result = invoke_function('rag', rag_payload)
         
         if rag_result['status'] != 'success':
             return {

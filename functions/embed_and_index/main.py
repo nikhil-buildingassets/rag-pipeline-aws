@@ -130,7 +130,7 @@ class RAGPipeline:
                 logger.info(f"Creating Pinecone index: {self.index_name}")
                 pinecone.create_index(
                     name=self.index_name,
-                    dimension=384,  # Update this based on your embedding model dimension
+                    dimension=384,
                     metric='cosine'
                 )
                 

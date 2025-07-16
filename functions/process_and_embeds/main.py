@@ -2,8 +2,6 @@ import json
 import os
 from typing import List, Dict, Optional, Any, Union
 import fitz  # PyMuPDF
-from nltk.tokenize import sent_tokenize
-import nltk
 from sentence_transformers import SentenceTransformer
 import numpy as np
 import logging
@@ -14,18 +12,24 @@ logger.setLevel(logging.INFO)
 
 # Set tokenizers parallelism to avoid warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ['TRANSFORMERS_CACHE'] = '/tmp/huggingface/transformers'
+os.environ['HF_HOME'] = '/tmp/huggingface'
 
 try:
-    MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+    # Try to load the local model first, fallback to downloading if not available
+    model_path = './my_model'
+    if os.path.exists(model_path):
+        logger.info("Loading pre-downloaded model from local path")
+        MODEL = SentenceTransformer(model_path)
+    else:
+        logger.info("Local model not found, downloading from HuggingFace")
+        MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+        # Save the model for future use
+        MODEL.save(model_path)
+        logger.info("Model saved locally for future use")
 except Exception as e:
     logger.error(f"Failed to load model: {str(e)}")
     raise
-
-# Download required NLTK data
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """AWS Lambda handler for processing files and generating embeddings."""
@@ -33,6 +37,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # Extract parameters from event
         file_content = event.get('content') or event.get('file_content')  # Support both keys
         embedding_only = event.get('embedding_only', False)
+        window_size = event.get('window_size', 512)  # Default chunk size
+        overlap = event.get('overlap', 50)  # Default overlap size
         
         if not file_content:
             return {
@@ -84,7 +90,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 }
         else:
             # Process as file with full chunking and embeddings
-            result = processor.process_file_bytes(file_content)
+            result = processor.process_file_bytes(file_content, window_size=window_size, overlap=overlap)
             return {
                 'statusCode': 200 if result['status'] == 'success' else 500,
                 'body': json.dumps(result)
@@ -183,66 +189,58 @@ class ProcessAndEmbed:
             if 'doc' in locals():
                 doc.close()
 
-    def chunk_text(self, text: str) -> List[str]:
-        """Chunk text optimized for semantic search."""
-        # Split into sentences first
-        sentences = sent_tokenize(text)
+    def chunk_text(self, text: str, window_size: int = 512, overlap: int = 50) -> List[str]:
+        """Chunk text using sliding window approach for optimal semantic search."""
+        # Clean the text first
+        cleaned_text = self._clean_text(text)
+        words = cleaned_text.split()
+        
+        # Handle edge cases
+        if len(words) <= window_size:
+            return [cleaned_text]
+        
         chunks = []
-        current_chunk = []
-        current_length = 0
-        max_chunk_size = 512  # Default chunk size
-        chunk_overlap = 50    # Default overlap size
+        start = 0
         
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if not sentence:
-                continue
-                
-            sentence_length = len(sentence.split())
+        while start < len(words):
+            end = min(start + window_size, len(words))
+            chunk_words = words[start:end]
+            chunk_text = " ".join(chunk_words)
             
-            # If adding this sentence would exceed chunk size
-            if current_length + sentence_length > max_chunk_size:
-                if current_chunk:
-                    chunks.append(" ".join(current_chunk))
-                current_chunk = [sentence]
-                current_length = sentence_length
-            else:
-                current_chunk.append(sentence)
-                current_length += sentence_length
-        
-        # Add the last chunk
-        if current_chunk:
-            chunks.append(" ".join(current_chunk))
-        
-        # Create overlapping chunks for better context
-        if chunk_overlap > 0 and len(chunks) > 1:
-            overlapped_chunks = []
-            for i in range(len(chunks)):
-                if i > 0:
-                    # Add overlap from previous chunk
-                    prev_words = chunks[i-1].split()[-chunk_overlap:]
-                    current_words = chunks[i].split()
-                    overlapped_chunks.append(" ".join(prev_words + current_words))
-                else:
-                    overlapped_chunks.append(chunks[i])
-            chunks = overlapped_chunks
+            # Only add non-empty chunks
+            if chunk_text.strip():
+                chunks.append(chunk_text)
+            
+            # Slide forward with overlap
+            start += window_size - overlap
+            
+            # Prevent infinite loop if overlap >= window_size
+            if start >= len(words):
+                break
         
         return chunks
 
-    def create_chunks(self) -> List[Dict]:
-        """Create chunks with metadata preservation."""
+    def create_chunks(self, window_size: int = 512, overlap: int = 50) -> List[Dict]:
+        """Create chunks with metadata preservation using sliding window approach."""
         self.chunked_docs = []
+        total_chunks = 0
+        
         for entry in self.text_chunks:
-            chunks = self.chunk_text(entry["text"])
+            chunks = self.chunk_text(entry["text"], window_size=window_size, overlap=overlap)
             for i, chunk in enumerate(chunks):
                 self.chunked_docs.append({
                     "page": entry["page"],
                     "text": chunk,
                     "chunk_index": i,
-                    "total_chunks": len(chunks)
+                    "total_chunks": len(chunks),
+                    "word_count": len(chunk.split()),
+                    "chunk_size": window_size,
+                    "overlap": overlap
                 })
+            total_chunks += len(chunks)
         
-        logger.info(f"Created {len(self.chunked_docs)} chunks")
+        logger.info(f"Created {len(self.chunked_docs)} chunks using sliding window (size={window_size}, overlap={overlap})")
+        logger.info(f"Average chunk size: {sum(len(chunk['text'].split()) for chunk in self.chunked_docs) / len(self.chunked_docs):.1f} words")
         return self.chunked_docs
 
     def generate_embeddings(self) -> np.ndarray:
@@ -260,8 +258,8 @@ class ProcessAndEmbed:
         logger.info(f"Generated embeddings of shape {self.embeddings.shape}")
         return self.embeddings
 
-    def process_file_bytes(self, file_content: bytes) -> Dict[str, Any]:
-        """Process file bytes and return chunks and embeddings."""
+    def process_file_bytes(self, file_content: bytes, window_size: int = 512, overlap: int = 50) -> Dict[str, Any]:
+        """Process file bytes and return chunks and embeddings using sliding window chunking."""
         try:
             # Extract text from file
             logger.info("Extracting text from file...")
@@ -270,9 +268,9 @@ class ProcessAndEmbed:
             if not self.text_chunks:
                 raise ValueError("No text was extracted from the file!")
             
-            # Create semantic chunks
-            logger.info("Creating semantic chunks...")
-            self.create_chunks()
+            # Create semantic chunks using sliding window
+            logger.info(f"Creating semantic chunks with window_size={window_size}, overlap={overlap}...")
+            self.create_chunks(window_size=window_size, overlap=overlap)
             
             # Generate embeddings
             logger.info("Generating embeddings...")
@@ -286,7 +284,11 @@ class ProcessAndEmbed:
                 'stats': {
                     'num_chunks': len(self.chunked_docs),
                     'embedding_dim': self.embeddings.shape[1] if self.embeddings is not None else None,
-                    'file_size_bytes': len(file_content)
+                    'file_size_bytes': len(file_content),
+                    'chunking_config': {
+                        'window_size': window_size,
+                        'overlap': overlap
+                    }
                 }
             }
             
