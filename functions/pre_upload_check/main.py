@@ -4,6 +4,7 @@ import base64
 import boto3
 import numpy as np
 import logging
+from jose import jwt, JWTError
 
 # Initialize AWS clients
 s3 = boto3.client('s3')
@@ -11,11 +12,32 @@ lambda_client = boto3.client('lambda')
 
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "dev")
 FILE_STORAGE_BUCKET_PREFIX = f'{ENVIRONMENT}_buildingassets'
+SECRET_NAME = f'{ENVIRONMENT}-buildingassets'
 
 LAMBDA_FUNCTIONS = {
     'embed': 'process_and_embeds',
     'processor': 'file_processor'
 }
+
+secrets_client = boto3.client('secretsmanager')
+
+def get_jwt_secret():
+    """Fetch the JWT secret from Secrets Manager."""
+    response = secrets_client.get_secret_value(SecretId=SECRET_NAME)
+    secret_string = response.get('SecretString')
+    if not secret_string:
+        raise Exception("SecretString not found")
+    secret_data = json.loads(secret_string)
+    return secret_data.get('JWT_SECRET')
+
+def verify_jwt(token: str, secret: str):
+    """Verify the JWT token using HS256 algorithm."""
+    try:
+        payload = jwt.decode(token, secret, algorithms=["HS256"])
+        return payload
+    except JWTError as e:
+        print(f"JWT verification error: {e}")
+        return None
 
 def get_function_name(alias):
     env = os.environ.get('ENVIRONMENT', 'dev')
@@ -163,8 +185,32 @@ def lambda_handler(event, context):
         file_key = event['file_key']
         file_content_base64 = event['file_content']
         replace_if_exists = event.get('replace_if_exists', False)
-        
-        # Decode base64 file content
+
+        auth_header = event['headers'].get('Authorization', '')
+        if not auth_header.startswith("Bearer "):
+            return {
+                'statusCode': 401,
+                'body': json.dumps({'message': 'Unauthorized - Missing Bearer token'})
+            }
+
+        token = auth_header.split(" ")[1]
+
+        try:
+            jwt_secret = get_jwt_secret()
+        except Exception as e:
+            print(f"Error fetching JWT secret: {e}")
+            return {
+                'statusCode': 500,
+                'body': json.dumps({'message': 'Internal server error'})
+            }
+
+        payload = verify_jwt(token, jwt_secret)
+        if not payload:
+            return {
+                'statusCode': 401,
+                'body': json.dumps({'message': 'Unauthorized - Invalid or expired token'})
+            }
+
         try:
             file_content = base64.b64decode(file_content_base64)
         except Exception as e:
@@ -178,17 +224,13 @@ def lambda_handler(event, context):
         
         file_key = f'{FILE_STORAGE_BUCKET_PREFIX}/{file_key}'
         
-        # Get file name and prefix
         file_name = os.path.basename(file_key)
         prefix = os.path.dirname(file_key)
         
-        # Get existing files
         existing_files = get_file_metadata(bucket, prefix)
         
-        # Check for exact name matches
         name_duplicates = [f for f in existing_files if f['name'] == file_name]
         
-        # If name duplicate found and not replacing, return early
         if name_duplicates and not replace_if_exists:
             return {
                 'statusCode': 200,
@@ -199,12 +241,8 @@ def lambda_handler(event, context):
                 })
             }
         
-        # Get embeddings for existing files
         existing_files_data = get_existing_file_embeddings(bucket, existing_files)
-
-        print(existing_files_data)
         
-        # Check for similar content
         similar_files = find_similar_files(file_content, existing_files_data)
         
         if similar_files and not replace_if_exists:
@@ -217,23 +255,19 @@ def lambda_handler(event, context):
                 })
             }
         
-        # If no duplicates found or replace_if_exists is True, ensure folder structure exists and upload the file
         try:
-            # Create folder structure if it doesn't exist
             ensure_folder_structure(bucket, file_key)
             
-            # Upload file to S3
             s3.put_object(
                 Bucket=bucket,
                 Key=file_key,
                 Body=file_content
             )
             
-            # Trigger file processor asynchronously
             try:
                 lambda_client.invoke(
                     FunctionName=get_function_name('processor'),
-                    InvocationType='Event',  # Async invocation
+                        InvocationType='Event',
                     Payload=json.dumps({
                         'file_url': f's3://{bucket}/{file_key}'
                     })
