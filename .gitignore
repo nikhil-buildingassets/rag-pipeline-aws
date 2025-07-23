@@ -2,4 +2,6 @@
 **/.env
 **/venv
 **/.DS_Store
-**/test.py
+**/tests
+qdrant_storage
+.vscode

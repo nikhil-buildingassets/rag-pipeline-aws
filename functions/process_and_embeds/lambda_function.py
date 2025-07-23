@@ -1,44 +1,132 @@
 import json
 import os
-from typing import List, Dict, Optional, Any, Union
+from typing import List, Dict, Any
 import fitz  # PyMuPDF
-from sentence_transformers import SentenceTransformer
+import requests
 import numpy as np
 import logging
+import boto3
+from pathlib import Path
+from typing import Tuple
+from urllib.parse import urlparse
 
 # Set up logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# Set tokenizers parallelism to avoid warnings
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ['TRANSFORMERS_CACHE'] = '/tmp/huggingface/transformers'
-os.environ['HF_HOME'] = '/tmp/huggingface'
+# Constants
+ENVIRONMENT = os.environ.get('ENVIRONMENT', 'dev')
+SECRET_NAME = f'{ENVIRONMENT}-buildingassets-secrets'
+OPENAI_API_URL = "https://api.openai.com/v1/embeddings"
+EMBEDDING_MODEL = "text-embedding-3-small"
 
-try:
-    # Try to load the local model first, fallback to downloading if not available
-    model_path = './my_model'
-    if os.path.exists(model_path):
-        logger.info("Loading pre-downloaded model from local path")
-        MODEL = SentenceTransformer(model_path)
-    else:
-        logger.info("Local model not found, downloading from HuggingFace")
-        MODEL = SentenceTransformer('all-MiniLM-L6-v2')
-        # Save the model for future use
-        MODEL.save(model_path)
-        logger.info("Model saved locally for future use")
-except Exception as e:
-    logger.error(f"Failed to load model: {str(e)}")
-    raise
+s3_client = boto3.client('s3')
+secrets_client = boto3.client('secretsmanager')
+
+def get_openai_api_key():
+    """Get OpenAI API key from Secrets Manager."""
+    try:
+        secret_response = secrets_client.get_secret_value(
+            SecretId=SECRET_NAME
+        )
+        credentials = json.loads(secret_response['SecretString'])
+        return credentials['OPENAI_API_KEY']
+    except Exception as e:
+        logger.error(f"Error getting OpenAI API key: {str(e)}")
+        raise
+
+def get_openai_embedding(text: str) -> np.ndarray:
+    """Get embedding from OpenAI API for a single text."""
+    OPENAI_API_KEY = get_openai_api_key()
+
+    if not OPENAI_API_KEY:
+        raise ValueError("OPENAI_API_KEY environment variable is required")
+    
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    data = {
+        "input": text,
+        "model": EMBEDDING_MODEL
+    }
+    
+    try:
+        response = requests.post(OPENAI_API_URL, headers=headers, json=data, timeout=30)
+        response.raise_for_status()
+        
+        result = response.json()
+        embedding = result['data'][0]['embedding']
+        return np.array(embedding)
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error calling OpenAI API: {str(e)}")
+        raise
+
+def get_openai_embeddings_batch(texts: List[str]) -> np.ndarray:
+    """Get embeddings from OpenAI API for a batch of texts."""
+    OPENAI_API_KEY = get_openai_api_key()
+
+    if not OPENAI_API_KEY:
+        raise ValueError("OPENAI_API_KEY environment variable is required")
+    
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    data = {
+        "input": texts,
+        "model": EMBEDDING_MODEL
+    }
+    
+    try:
+        response = requests.post(OPENAI_API_URL, headers=headers, json=data, timeout=60)
+        response.raise_for_status()
+        
+        result = response.json()
+        embeddings = [item['embedding'] for item in result['data']]
+        return np.array(embeddings)
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error calling OpenAI API: {str(e)}")
+        raise
+
+def get_file_from_s3(file_url: str) -> Tuple[bytes, str]:
+    """Get file content directly from S3 into memory."""
+    logger.info(f"Fetching file content from {file_url}")
+    
+    try:
+        # Parse the S3 URL
+        parsed_url = urlparse(file_url)
+        bucket = parsed_url.netloc.split('.')[0]
+        key = parsed_url.path.lstrip('/')
+        
+        # Get the object from S3
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        # Read the content into memory
+        file_content = response['Body'].read()
+        filename = Path(key).name
+        logger.info(f"Successfully fetched file content, size: {len(file_content)} bytes")
+        return file_content, filename
+    except Exception as e:
+        logger.error(f"Error fetching file from S3: {str(e)}")
+        raise
+
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """AWS Lambda handler for processing files and generating embeddings."""
     try:
         # Extract parameters from event
-        file_content = event.get('content') or event.get('file_content')  # Support both keys
         embedding_only = event.get('embedding_only', False)
         window_size = event.get('window_size', 512)  # Default chunk size
         overlap = event.get('overlap', 50)  # Default overlap size
+
+        file_url = event.get('file_url')
+        file_content, filename = get_file_from_s3(file_url)
+
+        logger.info(f"File url: {file_url}, filename: {filename}")
         
         if not file_content:
             return {
@@ -89,7 +177,6 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     'body': json.dumps(result)
                 }
         else:
-            # Process as file with full chunking and embeddings
             result = processor.process_file_bytes(file_content, window_size=window_size, overlap=overlap)
             return {
                 'statusCode': 200 if result['status'] == 'success' else 500,
@@ -111,7 +198,7 @@ class ProcessAndEmbed:
         # Initialize basic attributes
         self.text_chunks: List[Dict] = []
         self.chunked_docs: List[Dict] = []
-        self.embeddings: Optional[np.ndarray] = None
+        self.embeddings: np.ndarray | None = None
 
     def _clean_text(self, text: str) -> str:
         """Clean and normalize extracted text."""
@@ -141,7 +228,7 @@ class ProcessAndEmbed:
     def generate_single_embedding(self, text: str) -> np.ndarray:
         """Generate embedding for a single text string."""
         cleaned_text = self._clean_text(text)
-        embedding = MODEL.encode([cleaned_text], normalize_embeddings=True)[0]
+        embedding = get_openai_embedding(cleaned_text)
         return embedding
 
     def extract_text_from_file_bytes(self, file_content: bytes) -> List[Dict]:
@@ -251,7 +338,7 @@ class ProcessAndEmbed:
         all_embeddings = []
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]
-            batch_embeddings = MODEL.encode(batch, show_progress_bar=True, normalize_embeddings=True)
+            batch_embeddings = get_openai_embeddings_batch(batch)
             all_embeddings.append(batch_embeddings)
             
         self.embeddings = np.vstack(all_embeddings)

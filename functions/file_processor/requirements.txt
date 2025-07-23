@@ -1,7 +1,12 @@
-boto3==1.39.4
-botocore==1.39.4
+boto3==1.39.11
+botocore==1.39.11
+ecdsa==0.19.1
 jmespath==1.0.1
+psycopg2-binary==2.9.10
+pyasn1==0.6.1
 python-dateutil==2.9.0.post0
-s3transfer==0.13.0
+python-jose==3.5.0
+rsa==4.9.1
+s3transfer==0.13.1
 six==1.17.0
 urllib3==2.5.0
