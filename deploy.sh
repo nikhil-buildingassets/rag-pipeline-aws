@@ -389,39 +389,49 @@ deploy_with_zip() {
     local function_name=$1
     local function_dir=$2
     local prefixed_function_name=$3
-    
+
     echo "Deploying ${prefixed_function_name} using ZIP file..."
-    
+
     # Create temporary directory for packaging
-    local temp_dir=$(mktemp -d)
-    local zip_file="${temp_dir}/${function_name}.zip"
-    
-    # Copy function files to temp directory (excluding venv)
-    echo "Packaging function files..."
-    rsync -av --exclude='venv' "${function_dir}/" "${temp_dir}/"
-    
-    # Install dependencies if requirements.txt exists
+    local temp_dir
+    temp_dir=$(mktemp -d)
+    local build_dir="${temp_dir}/build"
+    mkdir -p "${build_dir}"
+
+    # Install dependencies into build directory
     if [[ -f "${function_dir}/requirements.txt" ]]; then
         echo "Installing Python dependencies..."
-        pip install -r "${function_dir}/requirements.txt" -t "${temp_dir}/" --quiet
+        pip install -r "${function_dir}/requirements.txt" \
+            --target "${build_dir}" \
+            --platform manylinux2014_x86_64 \
+            --implementation cp \
+            --python-version 3.12 \
+            --only-binary=:all: \
+            --upgrade
     fi
-    
+
+    # Copy function files (excluding venv and __pycache__) to build directory
+    echo "Copying function files..."
+    rsync -av --exclude='venv' --exclude='__pycache__' "${function_dir}/" "${build_dir}/" > /dev/null
+
     # Create ZIP file
+    local zip_file="${temp_dir}/${function_name}.zip"
     echo "Creating ZIP package..."
-    cd "${temp_dir}"
+    cd "${build_dir}"
     zip -r "${zip_file}" . -q
     cd - > /dev/null
-    
+
     # Update Lambda function code
     echo "Updating Lambda function code with ZIP file..."
     aws lambda update-function-code \
         --function-name "${prefixed_function_name}" \
         --zip-file "fileb://${zip_file}"
-    
-    # Clean up temporary files
+
+    # Clean up
     echo "Cleaning up temporary files..."
     rm -rf "${temp_dir}"
 }
+
 
 # Function to check if Lambda function exists
 check_function_exists() {
@@ -533,7 +543,7 @@ create_lambda_function() {
         aws lambda create-function \
             --function-name "${function_name}" \
             --runtime python3.12 \
-            --handler main.lambda_handler \
+            --handler lambda_function.lambda_handler \
             --role "${role_arn}" \
             --environment "Variables=${env_vars}" \
             --timeout 900 \
@@ -556,9 +566,9 @@ deploy_function() {
     local image_name="${function_name}"
     local image_tag="${ENVIRONMENT}"
     
-    # Check if function directory exists and has main.py
-    if [[ ! -d "${function_dir}" ]] || [[ ! -f "${function_dir}/main.py" ]]; then
-        echo "Skipping ${function_name}: Missing function directory or main.py"
+    # Check if function directory exists and has lambda_function.py
+    if [[ ! -d "${function_dir}" ]] || [[ ! -f "${function_dir}/lambda_function.py" ]]; then
+        echo "Skipping ${function_name}: Missing function directory or lambda_function.py"
         return
     fi
     
